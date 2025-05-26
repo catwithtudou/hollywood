@@ -11,12 +11,21 @@ import (
 	"github.com/DataDog/gostackparse"
 )
 
+// Envelope 封装消息和发送者 PID
+// Msg: 实际消息内容
+// Sender: 发送者 PID
 type Envelope struct {
 	Msg    any
 	Sender *PID
 }
 
 // Processer is an interface the abstracts the way a process behaves.
+// Processer 抽象了进程的行为接口
+// Start: 启动进程
+// PID: 获取进程 PID
+// Send: 发送消息
+// Invoke: 批量处理消息
+// Shutdown: 关闭进程
 type Processer interface {
 	Start()
 	PID() *PID
@@ -25,6 +34,12 @@ type Processer interface {
 	Shutdown()
 }
 
+// process 代表一个 actor 进程实例
+// inbox: 消息收件箱
+// context: actor 上下文
+// pid: 进程唯一标识
+// restarts: 重启次数
+// mbuffer: 崩溃时未处理的消息缓存
 type process struct {
 	Opts
 
@@ -35,6 +50,7 @@ type process struct {
 	mbuffer  []Envelope
 }
 
+// newProcess 创建一个新的 process 实例
 func newProcess(e *Engine, opts Opts) *process {
 	pid := NewPID(e.address, opts.Kind+pidSeparator+opts.ID)
 	ctx := newContext(opts.Context, e, pid)
@@ -48,6 +64,7 @@ func newProcess(e *Engine, opts Opts) *process {
 	return p
 }
 
+// applyMiddleware 应用中间件链到消息接收函数
 func applyMiddleware(rcv ReceiveFunc, middleware ...MiddlewareFunc) ReceiveFunc {
 	for i := len(middleware) - 1; i >= 0; i-- {
 		rcv = middleware[i](rcv)
@@ -55,6 +72,7 @@ func applyMiddleware(rcv ReceiveFunc, middleware ...MiddlewareFunc) ReceiveFunc 
 	return rcv
 }
 
+// Invoke 批量处理消息队列，支持崩溃恢复与优雅关闭
 func (p *process) Invoke(msgs []Envelope) {
 	var (
 		// numbers of msgs that need to be processed.
@@ -73,6 +91,7 @@ func (p *process) Invoke(msgs []Envelope) {
 			p.context.message = Stopped{}
 			p.context.receiver.Receive(p.context)
 
+			// 崩溃时将未处理的消息缓存，重启后重试
 			p.mbuffer = make([]Envelope, nmsg-nproc)
 			for i := 0; i < nmsg-nproc; i++ {
 				p.mbuffer[i] = msgs[i+nproc]
@@ -88,6 +107,7 @@ func (p *process) Invoke(msgs []Envelope) {
 			// If we need to gracefuly stop, we process all the messages
 			// from the inbox, otherwise we ignore and cleanup.
 			if pill.graceful {
+				// 优雅关闭时，处理剩余所有消息
 				msgsToProcess := msgs[processed:]
 				for _, m := range msgsToProcess {
 					p.invokeMsg(m)
@@ -101,6 +121,7 @@ func (p *process) Invoke(msgs []Envelope) {
 	}
 }
 
+// invokeMsg 处理单条消息，支持中间件
 func (p *process) invokeMsg(msg Envelope) {
 	// suppress poison pill messages here. they're private to the actor engine.
 	if _, ok := msg.Msg.(poisonPill); ok {
@@ -116,6 +137,7 @@ func (p *process) invokeMsg(msg Envelope) {
 	}
 }
 
+// Start 启动进程，初始化 receiver 并处理初始化/启动事件
 func (p *process) Start() {
 	recv := p.Producer()
 	p.context.receiver = recv
@@ -142,6 +164,7 @@ func (p *process) Start() {
 	p.inbox.Start(p)
 }
 
+// tryRestart 处理进程崩溃后的重启逻辑，支持最大重启次数与延迟
 func (p *process) tryRestart(v any) {
 	// InternalError does not take the maximum restarts into account.
 	// For now, InternalError is getting triggered when we are dialing
@@ -179,6 +202,7 @@ func (p *process) tryRestart(v any) {
 	p.Start()
 }
 
+// cleanup 清理进程资源，递归关闭所有子进程，移除注册表
 func (p *process) cleanup(cancel context.CancelFunc) {
 	defer cancel()
 
@@ -201,14 +225,20 @@ func (p *process) cleanup(cancel context.CancelFunc) {
 	p.context.engine.BroadcastEvent(ActorStoppedEvent{PID: p.pid, Timestamp: time.Now()})
 }
 
+// PID 返回进程的 PID
 func (p *process) PID() *PID { return p.pid }
+
+// Send 向进程收件箱发送消息
 func (p *process) Send(_ *PID, msg any, sender *PID) {
 	p.inbox.Send(Envelope{Msg: msg, Sender: sender})
 }
+
+// Shutdown 关闭进程，释放资源
 func (p *process) Shutdown() {
 	p.cleanup(nil)
 }
 
+// cleanTrace 清理 goroutine 堆栈信息，便于日志分析
 func cleanTrace(stack []byte) []byte {
 	goros, err := gostackparse.Parse(bytes.NewReader(stack))
 	if err != nil {
