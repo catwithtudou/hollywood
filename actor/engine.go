@@ -10,7 +10,10 @@ import (
 	"time"
 )
 
-// Remoter is an interface that abstract a remote that is tied to an engine.
+// Remoter 接口用于抽象与 Engine 绑定的远程通信能力
+// Address: 返回远程地址
+// Send: 发送消息
+// Start/Stop: 启动和停止远程服务
 type Remoter interface {
 	Address() string
 	Send(*PID, any, *PID)
@@ -18,15 +21,20 @@ type Remoter interface {
 	Stop() *sync.WaitGroup
 }
 
-// Producer is any function that can return a Receiver
+// Producer 是用于生成 Receiver 的工厂方法类型
 type Producer func() Receiver
 
-// Receiver is an interface that can receive and process messages.
+// Receiver 接口定义了消息接收与处理能力
+// Receive: 处理消息的入口
 type Receiver interface {
 	Receive(*Context)
 }
 
-// Engine represents the actor engine.
+// Engine 代表 actor 系统的引擎，负责进程管理、消息分发等
+// Registry: 进程注册表
+// address: 当前引擎地址
+// remote: 远程通信实现
+// eventStream: 事件流 PID
 type Engine struct {
 	Registry    *Registry
 	address     string
@@ -34,27 +42,27 @@ type Engine struct {
 	eventStream *PID
 }
 
-// EngineConfig holds the configuration of the engine.
+// EngineConfig 用于配置 Engine 的参数
+// remote: 远程通信实现
 type EngineConfig struct {
 	remote Remoter
 }
 
-// NewEngineConfig returns a new default EngineConfig.
+// NewEngineConfig 返回默认 EngineConfig
 func NewEngineConfig() EngineConfig {
 	return EngineConfig{}
 }
 
-// WithRemote sets the remote which will configure the engine so its capable
-// to send and receive messages over the network.
+// WithRemote 配置远程通信能力
 func (config EngineConfig) WithRemote(remote Remoter) EngineConfig {
 	config.remote = remote
 	return config
 }
 
-// NewEngine returns a new actor Engine given an EngineConfig.
+// NewEngine 根据 EngineConfig 创建新的 Engine 实例
 func NewEngine(config EngineConfig) (*Engine, error) {
 	e := &Engine{}
-	e.Registry = newRegistry(e) // need to init the registry in case we want a custom deadletter
+	e.Registry = newRegistry(e) // 初始化注册表，支持自定义 deadletter
 	e.address = LocalLookupAddr
 	if config.remote != nil {
 		e.remote = config.remote
@@ -64,19 +72,21 @@ func NewEngine(config EngineConfig) (*Engine, error) {
 			return nil, fmt.Errorf("failed to start remote: %w", err)
 		}
 	}
+	// 启动事件流进程
 	e.eventStream = e.Spawn(newEventStream(), "eventstream")
 	return e, nil
 }
 
-// Spawn spawns a process that will producer by the given Producer and
-// can be configured with the given opts.
+// Spawn 启动一个新的 actor 进程，使用 Producer 生成 Receiver
+// kind: 进程类型标识
+// opts: 可选配置项
 func (e *Engine) Spawn(p Producer, kind string, opts ...OptFunc) *PID {
 	options := DefaultOpts(p)
 	options.Kind = kind
 	for _, opt := range opts {
 		opt(&options)
 	}
-	// Check if we got an ID, generate otherwise
+	// 若未指定 ID，则自动生成
 	if len(options.ID) == 0 {
 		id := strconv.Itoa(rand.Intn(math.MaxInt))
 		options.ID = id
@@ -85,28 +95,26 @@ func (e *Engine) Spawn(p Producer, kind string, opts ...OptFunc) *PID {
 	return e.SpawnProc(proc)
 }
 
-// SpawnFunc spawns the given function as a stateless receiver/actor.
+// SpawnFunc 启动一个无状态函数型 actor
 func (e *Engine) SpawnFunc(f func(*Context), kind string, opts ...OptFunc) *PID {
 	return e.Spawn(newFuncReceiver(f), kind, opts...)
 }
 
-// SpawnProc spawns the give Processer. This function is useful when working
-// with custom created Processes. Take a look at the streamWriter as an example.
+// SpawnProc 启动自定义 Processer 实例
+// 适用于自定义进程场景
 func (e *Engine) SpawnProc(p Processer) *PID {
 	e.Registry.add(p)
 	return p.PID()
 }
 
-// Address returns the address of the actor engine. When there is
-// no remote configured, the "local" address will be used, otherwise
-// the listen address of the remote.
+// Address 返回当前引擎的地址
+// 若无远程配置则为 local，否则为远程监听地址
 func (e *Engine) Address() string {
 	return e.address
 }
 
-// Request sends the given message to the given PID as a "Request", returning
-// a response that will resolve in the future. Calling Response.Result() will
-// block until the deadline is exceeded or the response is being resolved.
+// Request 以"请求-响应"方式发送消息，返回 Response 对象
+// 调用 Response.Result() 会阻塞直到超时或收到响应
 func (e *Engine) Request(pid *PID, msg any, timeout time.Duration) *Response {
 	resp := NewResponse(e, timeout)
 	e.Registry.add(resp)
@@ -116,33 +124,27 @@ func (e *Engine) Request(pid *PID, msg any, timeout time.Duration) *Response {
 	return resp
 }
 
-// SendWithSender will send the given message to the given PID with the
-// given sender. Receivers receiving this message can check the sender
-// by calling Context.Sender().
+// SendWithSender 发送消息并指定 sender
+// 接收方可通过 Context.Sender() 获取 sender
 func (e *Engine) SendWithSender(pid *PID, msg any, sender *PID) {
 	e.send(pid, msg, sender)
 }
 
-// Send sends the given message to the given PID. If the message cannot be
-// delivered due to the fact that the given process is not registered.
-// The message will be sent to the DeadLetter process instead.
+// Send 发送消息，若目标进程不存在则转发到 DeadLetter
 func (e *Engine) Send(pid *PID, msg any) {
 	e.send(pid, msg, nil)
 }
 
-// BroadcastEvent will broadcast the given message over the eventstream, notifying all
-// actors that are subscribed.
+// BroadcastEvent 广播事件到 eventstream，通知所有订阅者
 func (e *Engine) BroadcastEvent(msg any) {
 	if e.eventStream != nil {
 		e.send(e.eventStream, msg, nil)
 	}
 }
 
+// send 是底层消息发送实现，自动区分本地/远程/丢失场景
 func (e *Engine) send(pid *PID, msg any, sender *PID) {
-	// TODO: We might want to log something here. Not yet decided
-	// what could make sense. Send to dead letter or as event?
-	// Dead letter would make sense cause the destination is not
-	// reachable.
+	// 若目标 PID 为空，直接丢弃
 	if pid == nil {
 		return
 	}
@@ -151,15 +153,15 @@ func (e *Engine) send(pid *PID, msg any, sender *PID) {
 		return
 	}
 	if e.remote == nil {
+		// 无远程时，广播 remote 缺失事件
 		e.BroadcastEvent(EngineRemoteMissingEvent{Target: pid, Sender: sender, Message: msg})
 		return
 	}
 	e.remote.Send(pid, msg, sender)
 }
 
-// SendRepeater is a struct that can be used to send a repeating message to a given PID.
-// If you need to have an actor wake up periodically, you can use a SendRepeater.
-// It is started by the SendRepeat method and stopped by it's Stop() method.
+// SendRepeater 用于周期性向指定 PID 发送消息
+// 可通过 Stop() 停止定时发送
 type SendRepeater struct {
 	engine   *Engine
 	self     *PID
@@ -169,6 +171,7 @@ type SendRepeater struct {
 	cancelch chan struct{}
 }
 
+// start 启动定时发送 goroutine
 func (sr SendRepeater) start() {
 	ticker := time.NewTicker(sr.interval)
 	go func() {
@@ -184,13 +187,13 @@ func (sr SendRepeater) start() {
 	}()
 }
 
-// Stop will stop the repeating message.
+// Stop 停止定时发送
 func (sr SendRepeater) Stop() {
 	close(sr.cancelch)
 }
 
-// SendRepeat will send the given message to the given PID each given interval.
-// It will return a SendRepeater struct that can stop the repeating message by calling Stop().
+// SendRepeat 每隔 interval 向指定 PID 发送消息
+// 返回 SendRepeater，可调用 Stop 停止
 func (e *Engine) SendRepeat(pid *PID, msg any, interval time.Duration) SendRepeater {
 	clonedPID := *pid.CloneVT()
 	sr := SendRepeater{
@@ -205,27 +208,23 @@ func (e *Engine) SendRepeat(pid *PID, msg any, interval time.Duration) SendRepea
 	return sr
 }
 
-// Stop will send a non-graceful poisonPill message to the process that is associated with the given PID.
-// The process will shut down immediately. A context is being returned that can be used to block / wait
-// until the process is stopped.
+// Stop 立即终止指定 PID 关联进程，返回 context 可用于等待停止完成
 func (e *Engine) Stop(pid *PID) context.Context {
 	return e.sendPoisonPill(context.Background(), false, pid)
 }
 
-// Poison will send a graceful poisonPill message to the process that is associated with the given PID.
-// The process will shut down gracefully once it has processed all the messages in the inbox.
-// A context is returned that can be used to block / wait until the process is stopped.
+// Poison 优雅终止指定 PID 关联进程，处理完消息后退出
+// 返回 context 可用于等待停止完成
 func (e *Engine) Poison(pid *PID) context.Context {
 	return e.sendPoisonPill(context.Background(), true, pid)
 }
 
-// PoisonCtx behaves the exact same as Poison, the only difference is that it accepts
-// a context as the first argument. The context can be used for custom timeouts and manual
-// cancelation.
+// PoisonCtx 同 Poison，但可自定义 context
 func (e *Engine) PoisonCtx(ctx context.Context, pid *PID) context.Context {
 	return e.sendPoisonPill(ctx, true, pid)
 }
 
+// sendPoisonPill 发送 poison pill 消息，支持优雅/非优雅关闭
 func (e *Engine) sendPoisonPill(ctx context.Context, graceful bool, pid *PID) context.Context {
 	var cancel context.CancelFunc
 	ctx, cancel = context.WithCancel(ctx)
@@ -233,7 +232,7 @@ func (e *Engine) sendPoisonPill(ctx context.Context, graceful bool, pid *PID) co
 		cancel:   cancel,
 		graceful: graceful,
 	}
-	// deadletter - if we didn't find a process, we will broadcast a DeadletterEvent
+	// 若目标进程不存在，广播 DeadLetter 事件
 	if e.Registry.get(pid) == nil {
 		e.BroadcastEvent(DeadLetterEvent{
 			Target:  pid,
@@ -247,13 +246,11 @@ func (e *Engine) sendPoisonPill(ctx context.Context, graceful bool, pid *PID) co
 	return ctx
 }
 
-// SendLocal will send the given message to the given PID. If the recipient is not found in the
-// registry, the message will be sent to the DeadLetter process instead. If there is no deadletter
-// process registered, the function will panic.
+// SendLocal 仅向本地进程发送消息，若目标不存在则广播 DeadLetter
 func (e *Engine) SendLocal(pid *PID, msg any, sender *PID) {
 	proc := e.Registry.get(pid)
 	if proc == nil {
-		// broadcast a deadLetter message
+		// 广播 deadLetter 消息
 		e.BroadcastEvent(DeadLetterEvent{
 			Target:  pid,
 			Message: msg,
@@ -264,16 +261,17 @@ func (e *Engine) SendLocal(pid *PID, msg any, sender *PID) {
 	proc.Send(pid, msg, sender)
 }
 
-// Subscribe will subscribe the given PID to the event stream.
+// Subscribe 订阅 eventstream 事件流
 func (e *Engine) Subscribe(pid *PID) {
 	e.Send(e.eventStream, eventSub{pid: pid})
 }
 
-// Unsubscribe will un subscribe the given PID from the event stream.
+// Unsubscribe 取消订阅 eventstream 事件流
 func (e *Engine) Unsubscribe(pid *PID) {
 	e.Send(e.eventStream, eventUnsub{pid: pid})
 }
 
+// isLocalMessage 判断消息目标是否为本地进程
 func (e *Engine) isLocalMessage(pid *PID) bool {
 	if pid == nil {
 		return false
@@ -281,10 +279,12 @@ func (e *Engine) isLocalMessage(pid *PID) bool {
 	return e.address == pid.Address
 }
 
+// funcReceiver 用于将函数适配为 Receiver
 type funcReceiver struct {
 	f func(*Context)
 }
 
+// newFuncReceiver 将函数包装为 Producer
 func newFuncReceiver(f func(*Context)) Producer {
 	return func() Receiver {
 		return &funcReceiver{
@@ -293,6 +293,7 @@ func newFuncReceiver(f func(*Context)) Producer {
 	}
 }
 
+// Receive 调用底层函数处理消息
 func (r *funcReceiver) Receive(c *Context) {
 	r.f(c)
 }
